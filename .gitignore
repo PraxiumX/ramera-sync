@@ -1,0 +1,15 @@
+# Ignore config files
+*.conf
+settings.conf
+
+# Ignore build artifacts
+/target/
+
+# Ignore records directory
+/records/
+
+# Ignore any local git metadata just in case
+/.git/
+
+# Ensure top-level workspace settings files are ignored
+settings.conf
