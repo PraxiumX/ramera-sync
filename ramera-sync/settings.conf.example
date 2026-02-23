@@ -1,0 +1,31 @@
+# Example settings.conf (sanitized). DO NOT commit real credentials.
+# Copy this file to `settings.conf` and fill in values locally.
+
+# Network discovery
+scan.cidr=192.168.1.0/24
+
+# NVR credentials (use strong, local-only values)
+nvr.username=admin
+# nvr.password=REPLACE_WITH_PASSWORD
+
+# Local ffmpeg (optional override). Prefer bundled ffmpeg/ffmpeg.
+ffmpeg.path=ffmpeg/ffmpeg
+
+# Storage
+records.dir=records
+
+# Backblaze B2 (optional). Use environment variables where possible.
+# Use literal values only on trusted machines. These are placeholders.
+b2.key_id=
+b2.application_key=
+b2.bucket_id=
+b2.file_prefix=ramera/nvr-snapshots
+b2.max_retentation_days=60
+b2.upload_lag_days=1
+
+# Logging
+log.level=info
+
+# Example notes:
+# - Never commit `settings.conf` with real passwords/keys into a public repo.
+# - Prefer storing secrets in environment variables and reference them here.
