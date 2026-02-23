@@ -13,7 +13,7 @@
 
 ## Project layout
 
-- Config: `settings.conf`
+- Config: `settings.conf` — runtime configuration (may contain sensitive credentials; do not commit to public repositories)
 - Local ffmpeg binary: `ffmpeg/ffmpeg`
 - Daily snapshot: `records/snapshot-YYYYMMDD.json`
 - Daily raw metadata files: `records/raw/YYYYMMDD/`
@@ -119,6 +119,7 @@ b2.upload_lag_days=1
   - `FFMPEG_BIN` env var
   - `ffmpeg/ffmpeg`
   - system `ffmpeg`
+- `run` and `run-local` auto-install local ffmpeg into `ffmpeg/` using `scripts/install_ffmpeg.sh` when `ffmpeg/ffmpeg` or `ffmpeg/ffprobe` is missing.
 - B2 uploads use SHA1 verification (`sha1sum`, `shasum`, or `openssl`) plus response metadata checks.
 - `video-clips` with `--clip-seconds 0` downloads full-length records.
 - `run-local` now always downloads all clips for the same snapshot cycle into a single folder:
