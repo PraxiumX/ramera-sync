@@ -13,3 +13,6 @@ settings.conf
 
 # Ensure top-level workspace settings files are ignored
 settings.conf
+
+# Runtime lock file
+.ramera-sync.lock
