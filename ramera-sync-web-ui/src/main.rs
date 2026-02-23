@@ -1,6 +1,7 @@
 use std::collections::{BTreeMap, HashMap};
 use std::net::SocketAddr;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
@@ -107,6 +108,8 @@ async fn main() {
     let app = Router::new()
         .route("/", get(index_page))
         .route("/day/{day}", get(day_page))
+        .route("/watch/day/{day}", get(watch_day_page))
+        .route("/merged/day/{day}", get(merged_day_video))
         .route("/download/{file_id}", get(download_file))
         .with_state(AppState { b2: cfg });
 
@@ -278,6 +281,10 @@ async fn day_page(
     body.push_str(&format!("<div class=\"hero\"><h1>Day {}</h1><p>Browse snapshot, raw payloads, and clip chunks.</p></div>", esc(&day)));
     body.push_str("<div class=\"toolbar\">");
     body.push_str("<a class=\"btn\" href=\"/\">Back</a>");
+    body.push_str(&format!(
+        "<a class=\"btn\" href=\"/watch/day/{}\">Watch merged day</a>",
+        esc(&day)
+    ));
     body.push_str("<form method=\"get\" class=\"inline\"><label for=\"camera\">Camera</label><select id=\"camera\" name=\"camera\"><option value=\"\">All</option>");
     for cam in &cameras {
         let selected = query.camera.as_deref() == Some(cam.as_str());
@@ -326,11 +333,14 @@ async fn day_page(
                 .iter()
                 .map(|f| f.content_length.unwrap_or(0))
                 .sum::<u64>();
+            let cam_q = urlencoding::encode(&cam);
             body.push_str(&format!(
-                "<h3>{}</h3><p class=\"note\">{} clip(s), {}</p>",
+                "<h3>{}</h3><p class=\"note\">{} clip(s), {} <a class=\"btn btn-small\" href=\"/watch/day/{}?camera={}\">Watch merged</a></p>",
                 esc(&cam),
                 list.len(),
-                format_size(cam_bytes)
+                format_size(cam_bytes),
+                esc(&day),
+                cam_q
             ));
             body.push_str(&render_file_table(&list));
         }
@@ -355,6 +365,107 @@ async fn day_page(
     Ok(Html(html_page(&format!("Day {day}"), &body)))
 }
 
+async fn watch_day_page(
+    AxumPath(day): AxumPath<String>,
+    Query(query): Query<DayQuery>,
+) -> Result<Html<String>, (StatusCode, String)> {
+    if !is_day(&day) {
+        return Err((StatusCode::BAD_REQUEST, "invalid day".to_string()));
+    }
+
+    let src = if let Some(cam) = query.camera.as_deref().filter(|v| !v.trim().is_empty()) {
+        format!("/merged/day/{}?camera={}", day, urlencoding::encode(cam))
+    } else {
+        format!("/merged/day/{day}")
+    };
+
+    let mut body = String::new();
+    body.push_str(&format!(
+        "<div class=\"hero\"><h1>Watch Day {}</h1><p>Merged playback for this day{}</p></div>",
+        esc(&day),
+        query
+            .camera
+            .as_deref()
+            .map(|c| format!(" (camera: {})", esc(c)))
+            .unwrap_or_default()
+    ));
+    body.push_str("<div class=\"toolbar\">");
+    body.push_str(&format!(
+        "<a class=\"btn\" href=\"/day/{}\">Back to day</a>",
+        esc(&day)
+    ));
+    body.push_str(&format!(
+        "<a class=\"btn\" href=\"{}\">Open stream directly</a>",
+        esc(&src)
+    ));
+    body.push_str("</div>");
+    body.push_str(&format!(
+        "<video controls autoplay preload=\"metadata\" style=\"width:100%;max-height:78vh;background:#000;border-radius:12px\" src=\"{}\"></video>",
+        esc(&src)
+    ));
+    body.push_str("<p class=\"note\">If playback does not start immediately, wait for merge generation to finish and reload.</p>");
+
+    Ok(Html(html_page(&format!("Watch {day}"), &body)))
+}
+
+async fn merged_day_video(
+    State(state): State<AppState>,
+    AxumPath(day): AxumPath<String>,
+    Query(query): Query<DayQuery>,
+) -> Result<Response, (StatusCode, String)> {
+    let op = next_op_id();
+    let started = Instant::now();
+    log_step(
+        op,
+        "merge.start",
+        &format!(
+            "day={} camera={}",
+            day,
+            query.camera.as_deref().unwrap_or("*")
+        ),
+    );
+
+    if !is_day(&day) {
+        return Err((StatusCode::BAD_REQUEST, "invalid day".to_string()));
+    }
+
+    let camera = query
+        .camera
+        .as_deref()
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+        .map(ToOwned::to_owned);
+
+    let (merged_path, merged_name) =
+        prepare_merged_day_file(op, &state.b2, &day, camera.as_deref()).await?;
+    let bytes = std::fs::read(&merged_path).map_err(|e| {
+        log_step(op, "merge.read_error", &e.to_string());
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("failed to read merged file {}: {e}", merged_path.display()),
+        )
+    })?;
+
+    log_step(
+        op,
+        "merge.done",
+        &format!(
+            "file={} size={} elapsed={}ms",
+            merged_name,
+            format_size(bytes.len() as u64),
+            started.elapsed().as_millis()
+        ),
+    );
+
+    let mut headers = HeaderMap::new();
+    headers.insert(header::CONTENT_TYPE, HeaderValue::from_static("video/mp4"));
+    if let Ok(value) = HeaderValue::from_str(&format!("inline; filename=\"{}\"", merged_name)) {
+        headers.insert(header::CONTENT_DISPOSITION, value);
+    }
+
+    Ok((headers, bytes).into_response())
+}
+
 async fn download_file(
     State(state): State<AppState>,
     AxumPath(file_id): AxumPath<String>,
@@ -370,38 +481,7 @@ async fn download_file(
     );
 
     let auth = authorize(op, &state.b2).await?;
-    let encoded_id = urlencoding::encode(&file_id);
-    let url = format!(
-        "{}/b2api/v2/b2_download_file_by_id?fileId={}",
-        auth.download_url, encoded_id
-    );
-
-    log_step(op, "download.request", &url);
-    let resp = reqwest::Client::new()
-        .get(url)
-        .header(header::AUTHORIZATION, auth.authorization_token)
-        .send()
-        .await
-        .map_err(|e| map_http_err(op, "download.http_error", e))?;
-
-    if !resp.status().is_success() {
-        let status = resp.status();
-        let body = resp.text().await.unwrap_or_default();
-        log_step(
-            op,
-            "download.fail",
-            &format!("status={} body={}", status, compact(&body)),
-        );
-        return Err((
-            StatusCode::BAD_GATEWAY,
-            format!("b2 download failed with {status}: {}", compact(&body)),
-        ));
-    }
-
-    let bytes = resp
-        .bytes()
-        .await
-        .map_err(|e| map_http_err(op, "download.read_error", e))?;
+    let bytes = download_file_by_id(op, &auth, &file_id).await?;
     log_step(
         op,
         "download.done",
@@ -581,6 +661,8 @@ fn is_day(day: &str) -> bool {
 fn detect_content_type(name: &str) -> &'static str {
     if name.ends_with(".mkv") {
         "video/x-matroska"
+    } else if name.ends_with(".mp4") {
+        "video/mp4"
     } else if name.ends_with(".json") {
         "application/json"
     } else if name.ends_with(".xml") {
@@ -776,4 +858,319 @@ fn log_step(op: u64, step: &str, detail: &str) {
         Err(_) => 0,
     };
     eprintln!("[ui][{}][op:{}] {} | {}", ts, op, step, detail);
+}
+
+async fn download_file_by_id(
+    op: u64,
+    auth: &AuthorizeResponse,
+    file_id: &str,
+) -> Result<Vec<u8>, (StatusCode, String)> {
+    let encoded_id = urlencoding::encode(file_id);
+
+    let mut bases = vec![
+        auth.api_url.trim_end_matches('/').to_string(),
+        auth.download_url.trim_end_matches('/').to_string(),
+    ];
+    if bases.get(0) == bases.get(1) {
+        let _ = bases.pop();
+    }
+
+    let client = reqwest::Client::new();
+    let mut last_error = String::new();
+
+    for (idx, base) in bases.iter().enumerate() {
+        let url = format!("{base}/b2api/v2/b2_download_file_by_id?fileId={encoded_id}");
+        log_step(
+            op,
+            "download.request",
+            &format!("attempt={} {}", idx + 1, url),
+        );
+
+        let resp = match client
+            .get(&url)
+            .header(header::AUTHORIZATION, &auth.authorization_token)
+            .send()
+            .await
+        {
+            Ok(v) => v,
+            Err(err) => {
+                last_error = err.to_string();
+                log_step(
+                    op,
+                    "download.http_error",
+                    &format!("attempt={} error={}", idx + 1, last_error),
+                );
+                continue;
+            }
+        };
+
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            last_error = format!("status={status} body={}", compact(&body));
+            log_step(
+                op,
+                "download.fail",
+                &format!("attempt={} {}", idx + 1, last_error),
+            );
+            continue;
+        }
+
+        let bytes = resp
+            .bytes()
+            .await
+            .map_err(|e| map_http_err(op, "download.read_error", e))?;
+        return Ok(bytes.to_vec());
+    }
+
+    if last_error.is_empty() {
+        last_error = "no download endpoint attempted".to_string();
+    }
+
+    Err((
+        StatusCode::BAD_GATEWAY,
+        format!("b2 download failed for file id {file_id}: {last_error}"),
+    ))
+}
+
+async fn prepare_merged_day_file(
+    op: u64,
+    cfg: &B2Config,
+    day: &str,
+    camera: Option<&str>,
+) -> Result<(PathBuf, String), (StatusCode, String)> {
+    let prefix_root = cfg.file_prefix.trim_end_matches('/');
+    let day_prefix = format!("{prefix_root}/records/{day}/");
+    let mut files = list_files(op, cfg, &day_prefix).await?;
+    files.sort_by(|a, b| a.file_name.cmp(&b.file_name));
+
+    let mut clips: Vec<ListFileItem> = files
+        .into_iter()
+        .filter(|f| f.file_name.contains("/clips/"))
+        .collect();
+
+    if let Some(cam) = camera {
+        clips.retain(|f| camera_key_from_clip_name(file_name_only(&f.file_name)) == cam);
+    }
+
+    if clips.is_empty() {
+        return Err((
+            StatusCode::NOT_FOUND,
+            format!(
+                "no clips found for day {}{}",
+                day,
+                camera
+                    .map(|c| format!(" and camera {}", c))
+                    .unwrap_or_default()
+            ),
+        ));
+    }
+
+    let camera_token = sanitize_filename_token(camera.unwrap_or("all"));
+    let merged_name = format!("merged-{day}-{camera_token}.mp4");
+    let cache_root =
+        std::env::var("UI_CACHE_DIR").unwrap_or_else(|_| ".ramera-sync-web-ui-cache".to_string());
+    let cache_dir = Path::new(&cache_root).join("merged").join(day);
+    std::fs::create_dir_all(&cache_dir).map_err(|e| {
+        log_step(op, "merge.cache_dir_error", &e.to_string());
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("failed to create cache dir {}: {e}", cache_dir.display()),
+        )
+    })?;
+
+    let merged_path = cache_dir.join(&merged_name);
+    let meta_path = cache_dir.join(format!("{merged_name}.meta"));
+    let signature = build_merge_signature(&clips);
+
+    if merged_path.exists() {
+        if let Ok(existing_sig) = std::fs::read_to_string(&meta_path) {
+            if existing_sig == signature {
+                log_step(
+                    op,
+                    "merge.cache_hit",
+                    &format!("path={} clips={}", merged_path.display(), clips.len()),
+                );
+                return Ok((merged_path, merged_name));
+            }
+        }
+    }
+
+    let work_dir = Path::new(&cache_root)
+        .join("work")
+        .join(format!("merge-{}-{}-{op}", day, camera_token));
+    if work_dir.exists() {
+        let _ = std::fs::remove_dir_all(&work_dir);
+    }
+    std::fs::create_dir_all(&work_dir).map_err(|e| {
+        log_step(op, "merge.work_dir_error", &e.to_string());
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("failed to create work dir {}: {e}", work_dir.display()),
+        )
+    })?;
+
+    let auth = authorize(op, cfg).await?;
+    let mut concat = String::new();
+
+    for (idx, file) in clips.iter().enumerate() {
+        let part_path = work_dir.join(format!("{:05}.mkv", idx + 1));
+        let bytes = download_file_by_id(op, &auth, &file.file_id).await?;
+        std::fs::write(&part_path, bytes).map_err(|e| {
+            log_step(op, "merge.write_part_error", &e.to_string());
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("failed to write clip part {}: {e}", part_path.display()),
+            )
+        })?;
+        let abs = absolute_path(&part_path).map_err(|e| {
+            log_step(op, "merge.path_error", &e);
+            (StatusCode::INTERNAL_SERVER_ERROR, e)
+        })?;
+        concat.push_str(&format!("file '{}'\n", escape_concat_path(&abs)));
+    }
+
+    let list_path = work_dir.join("concat.list");
+    std::fs::write(&list_path, concat).map_err(|e| {
+        log_step(op, "merge.concat_list_error", &e.to_string());
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("failed to write concat list {}: {e}", list_path.display()),
+        )
+    })?;
+
+    let ffmpeg_bin = resolve_ffmpeg_bin().ok_or_else(|| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "ffmpeg not found (set FFMPEG_BIN or install ffmpeg)".to_string(),
+        )
+    })?;
+    let out_tmp = work_dir.join("merged.tmp.mp4");
+    let status = Command::new(&ffmpeg_bin)
+        .arg("-hide_banner")
+        .arg("-loglevel")
+        .arg("error")
+        .arg("-y")
+        .arg("-f")
+        .arg("concat")
+        .arg("-safe")
+        .arg("0")
+        .arg("-i")
+        .arg(&list_path)
+        .arg("-c")
+        .arg("copy")
+        .arg("-movflags")
+        .arg("+faststart")
+        .arg(&out_tmp)
+        .status()
+        .map_err(|e| {
+            log_step(op, "merge.ffmpeg_start_error", &e.to_string());
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("failed to start ffmpeg: {e}"),
+            )
+        })?;
+
+    if !status.success() {
+        return Err((
+            StatusCode::BAD_GATEWAY,
+            format!("ffmpeg merge failed with status {status}"),
+        ));
+    }
+
+    std::fs::rename(&out_tmp, &merged_path).map_err(|e| {
+        log_step(op, "merge.rename_error", &e.to_string());
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!(
+                "failed to move merged output {} -> {}: {e}",
+                out_tmp.display(),
+                merged_path.display()
+            ),
+        )
+    })?;
+    std::fs::write(&meta_path, signature).map_err(|e| {
+        log_step(op, "merge.meta_error", &e.to_string());
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!(
+                "failed to write merge metadata {}: {e}",
+                meta_path.display()
+            ),
+        )
+    })?;
+
+    let _ = std::fs::remove_dir_all(&work_dir);
+    Ok((merged_path, merged_name))
+}
+
+fn build_merge_signature(files: &[ListFileItem]) -> String {
+    let mut out = format!("count={}\n", files.len());
+    for file in files {
+        out.push_str(&format!(
+            "{}|{}|{}\n",
+            file.file_id,
+            file.file_name,
+            file.content_length.unwrap_or(0)
+        ));
+    }
+    out
+}
+
+fn resolve_ffmpeg_bin() -> Option<String> {
+    if let Ok(path) = std::env::var("FFMPEG_BIN") {
+        if !path.trim().is_empty() {
+            return Some(path);
+        }
+    }
+
+    let local = PathBuf::from("ffmpeg").join("ffmpeg");
+    if local.exists() {
+        return Some(local.display().to_string());
+    }
+
+    if has_binary("ffmpeg") {
+        return Some("ffmpeg".to_string());
+    }
+
+    None
+}
+
+fn has_binary(bin: &str) -> bool {
+    Command::new(bin)
+        .arg("-version")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .is_ok()
+}
+
+fn absolute_path(path: &Path) -> Result<PathBuf, String> {
+    if path.is_absolute() {
+        return Ok(path.to_path_buf());
+    }
+    std::env::current_dir()
+        .map(|cwd| cwd.join(path))
+        .map_err(|e| format!("failed to read current dir: {e}"))
+}
+
+fn escape_concat_path(path: &Path) -> String {
+    path.to_string_lossy().replace('\'', "'\\''")
+}
+
+fn sanitize_filename_token(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    for c in value.chars() {
+        if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+            out.push(c);
+        } else {
+            out.push('_');
+        }
+    }
+    let out = out.trim_matches('_').to_string();
+    if out.is_empty() {
+        "all".to_string()
+    } else {
+        out
+    }
 }
