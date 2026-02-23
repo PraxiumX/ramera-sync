@@ -390,6 +390,14 @@ fn ensure_local_ffmpeg_for_run() -> Result<()> {
         return Ok(());
     }
 
+    if has_ffmpeg() && has_ffprobe() {
+        eprintln!(
+            "Local ffmpeg missing at {}, using available runtime ffmpeg/ffprobe.",
+            local_dir.display()
+        );
+        return Ok(());
+    }
+
     eprintln!(
         "Local ffmpeg not found at {}. Installing with scripts/install_ffmpeg.sh ...",
         local_dir.display()
@@ -400,10 +408,10 @@ fn ensure_local_ffmpeg_for_run() -> Result<()> {
         ))
     })?;
 
-    if !local_ffmpeg.exists() {
+    if !local_ffmpeg.exists() || !local_ffprobe.exists() {
         return Err(crate::error::AppError::Command(format!(
-            "ffmpeg installer completed but {} is still missing",
-            local_ffmpeg.display()
+            "ffmpeg installer completed but local binaries are still missing under {}",
+            local_dir.display()
         )));
     }
 

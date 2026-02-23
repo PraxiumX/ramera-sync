@@ -119,7 +119,7 @@ b2.upload_lag_days=1
   - `FFMPEG_BIN` env var
   - `ffmpeg/ffmpeg`
   - system `ffmpeg`
-- `run` and `run-local` auto-install local ffmpeg into `ffmpeg/` using `scripts/install_ffmpeg.sh` when `ffmpeg/ffmpeg` or `ffmpeg/ffprobe` is missing.
+- `run` and `run-local` prefer existing runtime `ffmpeg`/`ffprobe` (env var or system). If unavailable, they auto-install local binaries into `ffmpeg/` using `scripts/install_ffmpeg.sh`.
 - B2 uploads use SHA1 verification (`sha1sum`, `shasum`, or `openssl`) plus response metadata checks.
 - `video-clips` with `--clip-seconds 0` downloads full-length records.
 - `run-local` now always downloads all clips for the same snapshot cycle into a single folder:
