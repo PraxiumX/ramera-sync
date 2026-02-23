@@ -152,7 +152,7 @@ b2.upload_lag_days=1
 - If a clip file already exists with the same name, downloader attempts resume from existing MKV duration instead of restarting from zero.
 - Unlimited clip mode in manual `video-clips` command can download across devices in parallel (bounded concurrency).
 - Background cycles (`run` / `run-local`) use sequential device clip pulls for lower hardware load.
-- Writer commands are single-instance on host (lock file `.ramera-sync.lock`) to prevent concurrent state corruption.
+- Writer commands are single-instance on host (default lock file `/tmp/ramera-sync-cli.lock`) to prevent concurrent state corruption across different working directories. Override with `RAMERA_SYNC_LOCK_PATH` if needed.
 - B2 operations use retry with exponential backoff for transient errors.
 - CLI prints live progress logs during download (device discovery, track search, and each saved file).
 - Cloud sync prints live `[progress]` upload lines (snapshot/raw/clips/marker with uploaded size).

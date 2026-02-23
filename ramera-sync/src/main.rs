@@ -287,7 +287,7 @@ impl Drop for WriterLock {
 }
 
 fn acquire_writer_lock() -> Result<WriterLock> {
-    let lock_path = PathBuf::from(".ramera-sync.lock");
+    let lock_path = writer_lock_path();
     let pid = process::id();
     let content = format!("{pid}\n");
 
@@ -311,7 +311,13 @@ fn acquire_writer_lock() -> Result<WriterLock> {
                 }
             }
             // Stale lock: remove and retry once.
-            let _ = std::fs::remove_file(&lock_path);
+            std::fs::remove_file(&lock_path).map_err(|remove_err| {
+                crate::error::AppError::Command(format!(
+                    "stale lock exists but could not remove {}: {} (set RAMERA_SYNC_LOCK_PATH to a writable path if needed)",
+                    lock_path.display(),
+                    remove_err
+                ))
+            })?;
             let mut file = std::fs::OpenOptions::new()
                 .write(true)
                 .create_new(true)
@@ -322,6 +328,16 @@ fn acquire_writer_lock() -> Result<WriterLock> {
         }
         Err(err) => Err(err.into()),
     }
+}
+
+fn writer_lock_path() -> PathBuf {
+    if let Ok(path) = std::env::var("RAMERA_SYNC_LOCK_PATH") {
+        let trimmed = path.trim();
+        if !trimmed.is_empty() {
+            return PathBuf::from(trimmed);
+        }
+    }
+    PathBuf::from("/tmp/ramera-sync-cli.lock")
 }
 
 fn read_lock_pid(path: &Path) -> Option<u32> {
