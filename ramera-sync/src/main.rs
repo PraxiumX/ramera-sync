@@ -115,11 +115,13 @@ async fn run(cli: Cli) -> Result<()> {
     match cli.command {
         Commands::Run { config } => {
             let _lock = acquire_writer_lock()?;
+            ensure_local_ffmpeg_for_run()?;
             let cfg = load_config_or_fail(&config)?;
             run_loop(&cfg).await?;
         }
         Commands::RunLocal { config } => {
             let _lock = acquire_writer_lock()?;
+            ensure_local_ffmpeg_for_run()?;
             let cfg = load_config_or_fail(&config)?;
             run_local_loop(&cfg).await?;
         }
@@ -378,4 +380,32 @@ fn has_binary(bin: &str) -> bool {
         .stderr(std::process::Stdio::null())
         .status()
         .is_ok()
+}
+
+fn ensure_local_ffmpeg_for_run() -> Result<()> {
+    let local_dir = Path::new("ffmpeg");
+    let local_ffmpeg = local_dir.join("ffmpeg");
+    let local_ffprobe = local_dir.join("ffprobe");
+    if local_ffmpeg.exists() && local_ffprobe.exists() {
+        return Ok(());
+    }
+
+    eprintln!(
+        "Local ffmpeg not found at {}. Installing with scripts/install_ffmpeg.sh ...",
+        local_dir.display()
+    );
+    install_local_ffmpeg(local_dir, false).map_err(|err| {
+        crate::error::AppError::Command(format!(
+            "failed to auto-install local ffmpeg for run mode: {err}"
+        ))
+    })?;
+
+    if !local_ffmpeg.exists() {
+        return Err(crate::error::AppError::Command(format!(
+            "ffmpeg installer completed but {} is still missing",
+            local_ffmpeg.display()
+        )));
+    }
+
+    Ok(())
 }
