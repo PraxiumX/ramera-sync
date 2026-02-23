@@ -51,8 +51,6 @@ Replace with the release binary path if you built with `--release`.
 
 ## License
 
-MIT — see LICENSE (add one if you want a formal license file).
+MIT — see LICENSE.
 
 ---
-
-If you want, I can add a CI workflow, a CODE_OF_CONDUCT, or a LICENSE file next.
