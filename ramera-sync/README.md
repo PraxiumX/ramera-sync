@@ -51,6 +51,9 @@ cargo run -- --help
 # Show video-clips options
 cargo run -- video-clips --help
 
+# Run end-to-end smoke test (healthcheck + discover + records + 30s clip + B2 upload verify)
+cargo run -- test-mode --config settings.conf
+
 # Validate runtime dependencies/config (and optional B2 connectivity)
 cargo run -- healthcheck --config settings.conf
 cargo run -- healthcheck --config settings.conf --check-b2
@@ -68,6 +71,12 @@ cargo run -- video-records --config settings.conf --json
 
 # Download video clips (last 1 day, max 3 clips, each up to 10s)
 cargo run -- video-clips --config settings.conf --days 1 --max-clips 3 --clip-seconds 10
+
+# End-to-end smoke test with explicit options (example)
+cargo run -- test-mode --config settings.conf --days 1 --max-clips 1 --clip-seconds 30
+
+# Skip B2 verification when testing local-only
+cargo run -- test-mode --config settings.conf --no-b2
 
 # Download ALL clips found in range (0 means no clip limit)
 cargo run -- video-clips --config settings.conf --days 30 --max-clips 0 --clip-seconds 30
@@ -88,10 +97,13 @@ cargo run -- run --config settings.conf
 
 ## Testing flow (recommended)
 
-1. `cargo run -- discover --config settings.conf`
-2. `cargo run -- video-records --config settings.conf`
-3. `cargo run -- video-clips --config settings.conf --days 1 --max-clips 3 --clip-seconds 10`
-4. Check outputs:
+1. `cargo run -- test-mode --config settings.conf`
+2. If needed, run each step manually for troubleshooting:
+   - `cargo run -- discover --config settings.conf`
+   - `cargo run -- video-records --config settings.conf`
+   - `cargo run -- video-clips --config settings.conf --days 1 --max-clips 1 --clip-seconds 30`
+   - `cargo run -- sync-once --config settings.conf` (B2 upload path)
+3. Check outputs:
    - `records/snapshot-YYYYMMDD.json`
    - `records/raw/YYYYMMDD/`
    - `records/clips/<timestamp>/` or `records/clips/snapshot-<YYYYMMDD>/`

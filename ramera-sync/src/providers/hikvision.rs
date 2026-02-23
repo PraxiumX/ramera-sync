@@ -4,7 +4,7 @@ use std::time::SystemTime;
 
 use chrono::Utc;
 use tokio::process::Command;
-use tokio::time::{Duration, Instant};
+use tokio::time::{sleep, Duration, Instant};
 use tracing::{info, warn};
 use uuid::Uuid;
 
@@ -19,6 +19,8 @@ const HIKVISION_RECORD_PATHS: [&str; 2] = [
     "/ISAPI/System/deviceInfo",
     "/ISAPI/ContentMgmt/record/tracks",
 ];
+const CLIP_RETRY_ATTEMPTS: u32 = 12;
+const CLIP_RETRY_MAX_DELAY_SECS: u64 = 30;
 
 pub async fn fingerprint(
     client: &reqwest::Client,
@@ -246,7 +248,7 @@ pub async fn download_video_clips(
                 out.display()
             );
 
-            if run_ffmpeg_clip(&rtsp_uri, &out, clip_seconds).await? {
+            if run_ffmpeg_clip_with_retries(&rtsp_uri, &out, clip_seconds).await? {
                 info!("Hikvision {}: saved {}", device.ip, out.display());
                 saved.push(out);
             } else {
@@ -303,6 +305,43 @@ async fn find_tracks(
         }
     }
     Ok(Vec::new())
+}
+
+async fn run_ffmpeg_clip_with_retries(
+    rtsp_uri: &str,
+    output_path: &PathBuf,
+    clip_seconds: u32,
+) -> Result<bool> {
+    let name = output_path
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("clip");
+
+    for attempt in 1..=CLIP_RETRY_ATTEMPTS {
+        if run_ffmpeg_clip(rtsp_uri, output_path, clip_seconds).await? {
+            return Ok(true);
+        }
+
+        if attempt == CLIP_RETRY_ATTEMPTS {
+            break;
+        }
+
+        let delay = (attempt as u64 * 3).min(CLIP_RETRY_MAX_DELAY_SECS);
+        eprintln!(
+            "[progress] {}: ffmpeg attempt {}/{} failed (possible RTSP bandwidth limit), retrying in {}s",
+            name, attempt, CLIP_RETRY_ATTEMPTS, delay
+        );
+        warn!(
+            "Clip {} attempt {}/{} failed; retrying in {}s",
+            output_path.display(),
+            attempt,
+            CLIP_RETRY_ATTEMPTS,
+            delay
+        );
+        sleep(Duration::from_secs(delay)).await;
+    }
+
+    Ok(false)
 }
 
 async fn search_track_entries(

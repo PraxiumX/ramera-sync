@@ -12,14 +12,17 @@ mod types;
 
 use std::path::{Path, PathBuf};
 use std::process;
+use std::time::{Duration, Instant};
 
+use chrono::Utc;
 use clap::{Parser, Subcommand};
+use tokio::time::sleep;
 use tracing::info;
 use tracing_subscriber::EnvFilter;
 
 use crate::b2::B2Client;
 use crate::config::AppConfig;
-use crate::error::Result;
+use crate::error::{AppError, Result};
 use crate::ffmpeg::install_local_ffmpeg;
 use crate::service::{
     discover_only, fetch_records_to_local, fetch_video_clips_local, run_local_loop, run_loop,
@@ -98,6 +101,26 @@ enum Commands {
         config: PathBuf,
         #[arg(long, default_value_t = false)]
         check_b2: bool,
+    },
+    TestMode {
+        #[arg(short, long, default_value = "settings.conf")]
+        config: PathBuf,
+        #[arg(
+            long,
+            default_value_t = 30,
+            help = "Seconds per test clip (0 = full record)"
+        )]
+        clip_seconds: u32,
+        #[arg(long, default_value_t = 1, help = "Days to search for clips")]
+        days: u32,
+        #[arg(
+            long,
+            default_value_t = 1,
+            help = "Maximum clips to download during test (0 = no limit)"
+        )]
+        max_clips: usize,
+        #[arg(long, default_value_t = false, help = "Skip B2 upload verification step")]
+        no_b2: bool,
     },
 }
 
@@ -223,6 +246,18 @@ async fn run(cli: Cli) -> Result<()> {
         Commands::Healthcheck { config, check_b2 } => {
             let cfg = load_config_or_fail(&config)?;
             run_healthcheck(&cfg, check_b2).await?;
+        }
+        Commands::TestMode {
+            config,
+            clip_seconds,
+            days,
+            max_clips,
+            no_b2,
+        } => {
+            let _lock = acquire_writer_lock()?;
+            ensure_local_ffmpeg_for_run()?;
+            let cfg = load_config_or_fail(&config)?;
+            run_test_mode(&cfg, clip_seconds, days, max_clips, !no_b2).await?;
         }
     }
     Ok(())
@@ -415,5 +450,113 @@ fn ensure_local_ffmpeg_for_run() -> Result<()> {
         )));
     }
 
+    Ok(())
+}
+
+async fn run_test_mode(
+    cfg: &AppConfig,
+    clip_seconds: u32,
+    days: u32,
+    max_clips: usize,
+    include_b2: bool,
+) -> Result<()> {
+    const TEST_MODE_CLIP_ROUNDS: u32 = 10;
+    const TEST_MODE_CLIP_WAIT_SECS: u64 = 12;
+    let total_steps = if include_b2 { 5 } else { 4 };
+
+    let started = Instant::now();
+    println!("Test mode started.");
+    println!(
+        "- options: days={} max_clips={} clip_seconds={} include_b2={}",
+        days, max_clips, clip_seconds, include_b2
+    );
+
+    println!("Step 1/{total_steps}: healthcheck...");
+    run_healthcheck(cfg, include_b2).await?;
+
+    println!("Step 2/{total_steps}: discovering NVR devices...");
+    let devices = discover_only(cfg).await?;
+    println!("- discovered device(s): {}", devices.len());
+    if devices.is_empty() {
+        return Err(AppError::Command(
+            "test mode failed: no NVR devices discovered".to_string(),
+        ));
+    }
+
+    println!("Step 3/{total_steps}: fetching records snapshot...");
+    let records = fetch_records_to_local(cfg).await?;
+    println!(
+        "- records: devices={} records={} snapshot={} raw={}",
+        records.snapshot.device_count,
+        records.snapshot.record_count,
+        records.local_file.display(),
+        records.raw_records_dir.display()
+    );
+
+    let mut clips = None;
+    for round in 1..=TEST_MODE_CLIP_ROUNDS {
+        println!(
+            "Step 4/{total_steps}: downloading clip test (round {}/{})...",
+            round,
+            TEST_MODE_CLIP_ROUNDS
+        );
+        let outcome = fetch_video_clips_local(cfg, days, max_clips, clip_seconds).await?;
+        if !outcome.saved_clips.is_empty() {
+            clips = Some(outcome);
+            break;
+        }
+
+        if round < TEST_MODE_CLIP_ROUNDS {
+            println!(
+                "- no clips downloaded (likely transient NVR bandwidth/session limit); waiting {}s before retry",
+                TEST_MODE_CLIP_WAIT_SECS
+            );
+            sleep(Duration::from_secs(TEST_MODE_CLIP_WAIT_SECS)).await;
+        }
+    }
+
+    let clips = clips.ok_or_else(|| {
+        AppError::Command(format!(
+            "test mode failed: no clips downloaded after {} rounds (days={days}, max_clips={max_clips}, clip_seconds={clip_seconds})",
+            TEST_MODE_CLIP_ROUNDS
+        ))
+    })?;
+
+    println!("Test mode passed.");
+    println!(
+        "- clip test: downloaded {} clip(s) from {} device(s)",
+        clips.saved_clips.len(),
+        clips.device_count
+    );
+    for path in clips.saved_clips {
+        println!("  - {}", path.display());
+    }
+
+    if include_b2 {
+        println!("Step 5/{total_steps}: verifying B2 upload path...");
+        let mut upload_cfg = cfg.clone();
+        upload_cfg.b2.upload_lag_days = 0;
+        let outcome = sync_once(&upload_cfg).await?;
+        let day = Utc::now().format("%Y%m%d").to_string();
+        let day_prefix = format!(
+            "{}/records/{day}/",
+            upload_cfg.b2.file_prefix.trim_end_matches('/')
+        );
+        let b2 = B2Client::new(upload_cfg.b2.clone());
+        let files = b2.list_files(&day_prefix).await?;
+        if files.is_empty() {
+            return Err(AppError::Command(format!(
+                "test mode failed: B2 upload verification found no files under {}",
+                day_prefix
+            )));
+        }
+        println!(
+            "- b2 upload: ok (uploaded_days={}, files_under_day_prefix={})",
+            outcome.cloud.uploaded_days.len(),
+            files.len()
+        );
+    }
+
+    println!("- elapsed: {} ms", started.elapsed().as_millis());
     Ok(())
 }
