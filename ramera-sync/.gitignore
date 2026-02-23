@@ -1,0 +1,4 @@
+target/
+settings.conf
+ffmpeg/
+records/
