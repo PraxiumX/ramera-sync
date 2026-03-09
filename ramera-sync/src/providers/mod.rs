@@ -1,7 +1,7 @@
 pub mod generic;
 pub mod hikvision;
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 
@@ -18,6 +18,12 @@ pub struct ProviderFingerprint {
     pub source_url: Option<String>,
     pub preview: Option<String>,
     pub is_nvr: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct TrackActivity {
+    pub track_id: u32,
+    pub has_recent_records: bool,
 }
 
 pub async fn fingerprint_device(
@@ -63,6 +69,8 @@ pub async fn download_video_clips_for_device(
     days: u32,
     max_clips: usize,
     clip_seconds: u32,
+    max_chunk_size_mb: u32,
+    track_rules: Option<&HashMap<u32, bool>>,
     output_dir: Option<&Path>,
 ) -> Result<Vec<PathBuf>> {
     match device.provider.as_str() {
@@ -74,10 +82,35 @@ pub async fn download_video_clips_for_device(
                 days,
                 max_clips,
                 clip_seconds,
+                max_chunk_size_mb,
+                track_rules,
                 output_dir,
             )
             .await
         }
+        _ => Ok(Vec::new()),
+    }
+}
+
+pub async fn list_video_tracks_for_device(
+    client: &reqwest::Client,
+    device: &NvrDevice,
+    cfg: &NvrConfig,
+) -> Result<Vec<u32>> {
+    match device.provider.as_str() {
+        "hikvision" => hikvision::list_video_tracks(client, device, cfg).await,
+        _ => Ok(Vec::new()),
+    }
+}
+
+pub async fn probe_track_activity_for_device(
+    client: &reqwest::Client,
+    device: &NvrDevice,
+    cfg: &NvrConfig,
+    days: u32,
+) -> Result<Vec<TrackActivity>> {
+    match device.provider.as_str() {
+        "hikvision" => hikvision::probe_track_activity(client, device, cfg, days).await,
         _ => Ok(Vec::new()),
     }
 }

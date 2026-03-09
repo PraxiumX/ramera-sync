@@ -1,31 +1,34 @@
-# Example settings.conf (sanitized). DO NOT commit real credentials.
-# Copy this file to `settings.conf` and fill in values locally.
+# ramera-sync settings.conf
+# Format: key=value
+# Lists are comma-separated values.
+# Empty value means None for optional fields.
 
-# Network discovery
 scan.cidr=192.168.1.0/24
+scan.ports=80,443,554,8000
+scan.connect_timeout_ms=600
+scan.concurrency=128
 
-# NVR credentials (use strong, local-only values)
-nvr.username=admin
-# nvr.password=REPLACE_WITH_PASSWORD
+nvr.username=
+nvr.password=
+nvr.record_paths=/ISAPI/System/deviceInfo,/ISAPI/ContentMgmt/record/tracks,/cgi-bin/magicBox.cgi?action=getSystemInfo,/api/records
+nvr.request_timeout_ms=1500
+nvr.include_https=true
 
-# Local ffmpeg (optional override). Prefer bundled ffmpeg/ffmpeg.
-ffmpeg.path=ffmpeg/ffmpeg
+scheduler.interval_seconds=300
 
-# Storage
-records.dir=records
+# Download chunk size limit (in MB) to prevent crashing on low-resource PCs
+# Recommended: 100-500 MB
+download.max_chunk_size_mb=500
+# Cloud sync clip length in seconds (0 = full record)
+download.sync_clip_seconds=0
 
-# Backblaze B2 (optional). Use environment variables where possible.
-# Use literal values only on trusted machines. These are placeholders.
-b2.key_id=
-b2.application_key=
-b2.bucket_id=
+b2.key_id=${B2_KEY_ID}
+b2.application_key=${B2_APPLICATION_KEY}
+b2.bucket_id=${B2_BUCKET_ID}
 b2.file_prefix=ramera/nvr-snapshots
-b2.max_retentation_days=60
+b2.api_base=https://api.backblazeb2.com
+b2.max_retentation_days=7
 b2.upload_lag_days=1
 
-# Logging
-log.level=info
-
-# Example notes:
-# - Never commit `settings.conf` with real passwords/keys into a public repo.
-# - Prefer storing secrets in environment variables and reference them here.
+# Suppress progress/tracing logs (true/false)
+zero_log=false

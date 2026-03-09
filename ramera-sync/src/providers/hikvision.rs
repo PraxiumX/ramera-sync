@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::Command as StdCommand;
 use std::time::SystemTime;
@@ -11,7 +12,7 @@ use uuid::Uuid;
 use crate::config::NvrConfig;
 use crate::error::{AppError, Result};
 use crate::http_auth::{get_with_auth, post_xml_with_auth};
-use crate::providers::{build_base_urls, merge_paths, preview, ProviderFingerprint};
+use crate::providers::{build_base_urls, merge_paths, preview, ProviderFingerprint, TrackActivity};
 use crate::types::{DeviceRecord, NvrDevice};
 
 const HIKVISION_FINGERPRINT_PATH: &str = "/ISAPI/System/deviceInfo";
@@ -156,6 +157,8 @@ pub async fn download_video_clips(
     days: u32,
     max_clips: usize,
     clip_seconds: u32,
+    max_chunk_size_mb: u32,
+    track_rules: Option<&HashMap<u32, bool>>,
     output_dir: Option<&Path>,
 ) -> Result<Vec<PathBuf>> {
     info!(
@@ -186,12 +189,15 @@ pub async fn download_video_clips(
         info!("Hikvision {}: no tracks found", device.ip);
         return Ok(Vec::new());
     }
-    info!(
-        "Hikvision {}: discovered {} track(s): {:?}",
-        device.ip,
-        tracks.len(),
-        tracks
-    );
+    let tracks = apply_track_rules(tracks, track_rules);
+    if tracks.is_empty() {
+        info!(
+            "Hikvision {}: all tracks are disabled by camera-filter.conf",
+            device.ip
+        );
+        return Ok(Vec::new());
+    }
+    info!("Hikvision {}: active track(s): {:?}", device.ip, tracks);
 
     let day_start = chrono::Utc::now() - chrono::Duration::days(i64::from(days.max(1) - 1));
     let search_start = day_start
@@ -215,9 +221,16 @@ pub async fn download_video_clips(
         }
 
         info!("Hikvision {}: searching track {}", device.ip, track_id);
-        let entries =
-            search_track_entries(client, &base_urls, cfg, track_id, search_start, search_end)
-                .await?;
+        let entries = search_track_entries(
+            client,
+            &base_urls,
+            cfg,
+            track_id,
+            search_start,
+            search_end,
+            100,
+        )
+        .await?;
         info!(
             "Hikvision {}: track {} returned {} record item(s)",
             device.ip,
@@ -248,7 +261,9 @@ pub async fn download_video_clips(
                 out.display()
             );
 
-            if run_ffmpeg_clip_with_retries(&rtsp_uri, &out, clip_seconds).await? {
+            if run_ffmpeg_clip_with_retries(&rtsp_uri, &out, clip_seconds, max_chunk_size_mb)
+                .await?
+            {
                 info!("Hikvision {}: saved {}", device.ip, out.display());
                 saved.push(out);
             } else {
@@ -266,6 +281,54 @@ pub async fn download_video_clips(
         saved.len()
     );
     Ok(saved)
+}
+
+pub async fn list_video_tracks(
+    client: &reqwest::Client,
+    device: &NvrDevice,
+    cfg: &NvrConfig,
+) -> Result<Vec<u32>> {
+    let base_urls = build_base_urls(device.ip, &device.open_ports, cfg.include_https);
+    find_tracks(client, &base_urls, cfg).await
+}
+
+pub async fn probe_track_activity(
+    client: &reqwest::Client,
+    device: &NvrDevice,
+    cfg: &NvrConfig,
+    days: u32,
+) -> Result<Vec<TrackActivity>> {
+    let base_urls = build_base_urls(device.ip, &device.open_ports, cfg.include_https);
+    let tracks = find_tracks(client, &base_urls, cfg).await?;
+    if tracks.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let day_start = chrono::Utc::now() - chrono::Duration::days(i64::from(days.max(1) - 1));
+    let search_start = day_start
+        .date_naive()
+        .and_hms_opt(0, 0, 0)
+        .unwrap_or_else(|| chrono::Utc::now().naive_utc());
+    let search_end = (chrono::Utc::now() + chrono::Duration::hours(24)).naive_utc();
+
+    let mut out = Vec::with_capacity(tracks.len());
+    for track_id in tracks {
+        let entries = search_track_entries(
+            client,
+            &base_urls,
+            cfg,
+            track_id,
+            search_start,
+            search_end,
+            1,
+        )
+        .await?;
+        out.push(TrackActivity {
+            track_id,
+            has_recent_records: !entries.is_empty(),
+        });
+    }
+    Ok(out)
 }
 
 #[derive(Debug, Clone)]
@@ -307,10 +370,22 @@ async fn find_tracks(
     Ok(Vec::new())
 }
 
+fn apply_track_rules(tracks: Vec<u32>, track_rules: Option<&HashMap<u32, bool>>) -> Vec<u32> {
+    let Some(track_rules) = track_rules else {
+        return tracks;
+    };
+
+    tracks
+        .into_iter()
+        .filter(|track_id| track_rules.get(track_id).copied().unwrap_or(true))
+        .collect()
+}
+
 async fn run_ffmpeg_clip_with_retries(
     rtsp_uri: &str,
     output_path: &PathBuf,
     clip_seconds: u32,
+    max_chunk_size_mb: u32,
 ) -> Result<bool> {
     let name = output_path
         .file_name()
@@ -318,7 +393,7 @@ async fn run_ffmpeg_clip_with_retries(
         .unwrap_or("clip");
 
     for attempt in 1..=CLIP_RETRY_ATTEMPTS {
-        if run_ffmpeg_clip(rtsp_uri, output_path, clip_seconds).await? {
+        if run_ffmpeg_clip(rtsp_uri, output_path, clip_seconds, max_chunk_size_mb).await? {
             return Ok(true);
         }
 
@@ -327,7 +402,7 @@ async fn run_ffmpeg_clip_with_retries(
         }
 
         let delay = (attempt as u64 * 3).min(CLIP_RETRY_MAX_DELAY_SECS);
-        eprintln!(
+        crate::progress!(
             "[progress] {}: ffmpeg attempt {}/{} failed (possible RTSP bandwidth limit), retrying in {}s",
             name, attempt, CLIP_RETRY_ATTEMPTS, delay
         );
@@ -351,17 +426,19 @@ async fn search_track_entries(
     track_id: u32,
     start: chrono::NaiveDateTime,
     end: chrono::NaiveDateTime,
+    max_results: usize,
 ) -> Result<Vec<PlaybackEntry>> {
     let start = start.format("%Y-%m-%dT%H:%M:%SZ").to_string();
     let end = end.format("%Y-%m-%dT%H:%M:%SZ").to_string();
     let search_id = format!("{{{}}}", Uuid::new_v4());
+    let max_results = max_results.max(1);
 
     let xml = format!(
         "<?xml version='1.0' encoding='utf-8'?>\
 <CMSearchDescription><searchID>{search_id}</searchID>\
 <trackList><trackID>{track_id}</trackID></trackList>\
 <timeSpanList><timeSpan><startTime>{start}</startTime><endTime>{end}</endTime></timeSpan></timeSpanList>\
-<maxResults>100</maxResults><searchResultPostion>0</searchResultPostion>\
+<maxResults>{max_results}</maxResults><searchResultPostion>0</searchResultPostion>\
 <metadataList><metadataDescriptor>//recordType.meta.std-cgi.com</metadataDescriptor></metadataList>\
 </CMSearchDescription>"
     );
@@ -391,11 +468,21 @@ async fn search_track_entries(
     Ok(Vec::new())
 }
 
-async fn run_ffmpeg_clip(rtsp_uri: &str, output_path: &PathBuf, clip_seconds: u32) -> Result<bool> {
+async fn run_ffmpeg_clip(
+    rtsp_uri: &str,
+    output_path: &PathBuf,
+    clip_seconds: u32,
+    max_chunk_size_mb: u32,
+) -> Result<bool> {
     recover_pending_resume_segment(output_path);
     let complete_marker = clip_complete_marker_path(output_path);
+    let clip_name = output_path
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("clip");
 
     let full_length = clip_seconds == 0;
+    let max_size_bytes = u64::from(max_chunk_size_mb) * 1024 * 1024;
     let existing_bytes = std::fs::metadata(output_path).map(|m| m.len()).unwrap_or(0);
     let existing_secs = if existing_bytes > 0 {
         probe_duration_seconds(output_path).unwrap_or(0.0)
@@ -405,13 +492,20 @@ async fn run_ffmpeg_clip(rtsp_uri: &str, output_path: &PathBuf, clip_seconds: u3
 
     if !full_length && existing_secs >= (f64::from(clip_seconds) - 0.5).max(0.0) {
         write_clip_complete_marker(output_path, existing_bytes)?;
-        eprintln!(
+        crate::progress!(
             "[progress] {}: already complete {}, skipping",
-            output_path
-                .file_name()
-                .and_then(|s| s.to_str())
-                .unwrap_or("clip"),
+            clip_name,
             format_size(existing_bytes)
+        );
+        return Ok(existing_bytes > 0);
+    }
+
+    if existing_bytes >= max_size_bytes {
+        write_clip_complete_marker(output_path, existing_bytes)?;
+        crate::progress!(
+            "[progress] {}: reached configured max chunk size {}, skipping",
+            clip_name,
+            format_size(max_size_bytes)
         );
         return Ok(existing_bytes > 0);
     }
@@ -426,12 +520,9 @@ async fn run_ffmpeg_clip(rtsp_uri: &str, output_path: &PathBuf, clip_seconds: u3
         segment_path = hidden_sidecar_path(output_path, "resume.part");
         let _ = std::fs::remove_file(&segment_path);
         needs_merge = true;
-        eprintln!(
+        crate::progress!(
             "[progress] {}: resuming from {:.1}s ({} already saved)",
-            output_path
-                .file_name()
-                .and_then(|s| s.to_str())
-                .unwrap_or("clip"),
+            clip_name,
             resume_from_secs,
             format_size(base_bytes)
         );
@@ -459,12 +550,9 @@ async fn run_ffmpeg_clip(rtsp_uri: &str, output_path: &PathBuf, clip_seconds: u3
         let remaining = (f64::from(clip_seconds) - resume_from_secs).max(0.0);
         if remaining <= 0.25 {
             write_clip_complete_marker(output_path, existing_bytes)?;
-            eprintln!(
+            crate::progress!(
                 "[progress] {}: already complete {}, skipping",
-                output_path
-                    .file_name()
-                    .and_then(|s| s.to_str())
-                    .unwrap_or("clip"),
+                clip_name,
                 format_size(existing_bytes)
             );
             return Ok(existing_bytes > 0);
@@ -472,11 +560,22 @@ async fn run_ffmpeg_clip(rtsp_uri: &str, output_path: &PathBuf, clip_seconds: u3
         cmd.arg("-t").arg(format!("{remaining:.3}"));
     }
 
-    cmd.arg("-c:v")
-        .arg("copy")
-        .arg("-f")
-        .arg("matroska")
-        .arg(&segment_path);
+    cmd.arg("-c:v").arg("copy").arg("-f").arg("matroska");
+
+    // Keep the final file bounded by max chunk size, including resumed downloads.
+    let remaining_size_limit = max_size_bytes.saturating_sub(base_bytes);
+    if remaining_size_limit == 0 {
+        write_clip_complete_marker(output_path, existing_bytes)?;
+        crate::progress!(
+            "[progress] {}: reached configured max chunk size {}, skipping",
+            clip_name,
+            format_size(max_size_bytes)
+        );
+        return Ok(existing_bytes > 0);
+    }
+    cmd.arg("-fs").arg(remaining_size_limit.to_string());
+
+    cmd.arg(&segment_path);
 
     let _ = std::fs::remove_file(&complete_marker);
 
@@ -585,7 +684,7 @@ fn print_clip_progress(
     match target_bytes {
         Some(target) if target > 0 => {
             let percent = (downloaded_bytes as f64 / target as f64) * 100.0;
-            eprintln!(
+            crate::progress!(
                 "[progress] {}: {} / {} ({:.0}%) at {}",
                 name,
                 downloaded,
@@ -595,7 +694,7 @@ fn print_clip_progress(
             );
         }
         _ => {
-            eprintln!("[progress] {}: {} downloaded at {}", name, downloaded, mbps);
+            crate::progress!("[progress] {}: {} downloaded at {}", name, downloaded, mbps);
         }
     }
 }
@@ -605,7 +704,7 @@ fn print_clip_done(output_path: &Path, downloaded_bytes: u64, elapsed: Duration)
         .file_name()
         .and_then(|s| s.to_str())
         .unwrap_or("clip");
-    eprintln!(
+    crate::progress!(
         "[progress] {}: done {}, avg {}",
         name,
         format_size(downloaded_bytes),
@@ -738,7 +837,7 @@ fn recover_pending_resume_segment(output_path: &Path) {
         if let (Some(final_mtime), Some(segment_mtime)) = (final_mtime, segment_mtime) {
             if final_mtime >= segment_mtime {
                 let _ = std::fs::remove_file(&segment_path);
-                eprintln!(
+                crate::progress!(
                     "[progress] {}: removed stale resume segment",
                     output_path
                         .file_name()
@@ -752,7 +851,7 @@ fn recover_pending_resume_segment(output_path: &Path) {
 
     match merge_segments(output_path, &segment_path) {
         Ok(()) => {
-            eprintln!(
+            crate::progress!(
                 "[progress] {}: recovered pending resume segment",
                 output_path
                     .file_name()

@@ -6,10 +6,12 @@ use std::time::Duration;
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use futures::stream::{self, StreamExt};
 use serde::{Deserialize, Serialize};
+use tokio::sync::watch;
 use tokio::time;
 use tracing::{error, info, warn};
 
 use crate::b2::{B2Client, B2File};
+use crate::camera_filter::{camera_filter_path_for_config, CameraFilter};
 use crate::config::AppConfig;
 use crate::discovery::discover_devices;
 use crate::error::{AppError, Result};
@@ -59,22 +61,52 @@ pub async fn discover_only(cfg: &AppConfig) -> Result<Vec<NvrDevice>> {
     discover_devices(&cfg.scan, &cfg.nvr).await
 }
 
-pub async fn sync_once(cfg: &AppConfig) -> Result<SyncOutcome> {
+pub async fn sync_once(cfg: &AppConfig, config_path: &Path) -> Result<SyncOutcome> {
     let b2 = B2Client::new(cfg.b2.clone());
-    let fetch = fetch_or_restore_today_snapshot(cfg, &b2).await?;
+    let fetch = fetch_or_restore_today_snapshot(cfg, config_path, &b2).await?;
     let day = day_for_snapshot(&fetch.snapshot);
     ensure_snapshot_uploaded_for_day(cfg, &b2, &day, &fetch.local_file).await?;
+
+    let stream_uploads = is_day_upload_eligible(cfg, &day);
+    let mut bg_stop = None;
+    let mut bg_join = None;
+    if stream_uploads {
+        let (stop_tx, stop_rx) = watch::channel(false);
+        bg_stop = Some(stop_tx);
+        let cfg_bg = cfg.clone();
+        let b2_bg = b2.clone();
+        let day_bg = day.clone();
+        bg_join = Some(tokio::spawn(async move {
+            stream_open_day_uploads_until_stopped(cfg_bg, b2_bg, day_bg, stop_rx).await;
+        }));
+    }
 
     let snapshot_clips_dir = clips_dir_for_snapshot(fetch.snapshot.generated_at);
     let _clips = fetch_video_clips_for_devices(
         cfg,
+        config_path,
         &fetch.snapshot.devices,
         1,
         0,
-        0,
+        cfg.download.sync_clip_seconds,
         Some(&snapshot_clips_dir),
     )
     .await?;
+
+    if let Some(stop_tx) = bg_stop.take() {
+        let _ = stop_tx.send(true);
+    }
+    if let Some(join) = bg_join.take() {
+        if let Err(err) = join.await {
+            warn!("background clip uploader task join failed: {}", err);
+        }
+    }
+    if stream_uploads {
+        if let Err(err) = upload_local_day(cfg, &b2, &day, false, false, true).await {
+            warn!("final open-day upload flush failed for {}: {}", day, err);
+        }
+    }
+
     let cloud = sync_local_days_to_b2(cfg, &b2)
         .await
         .map_err(|err| match err {
@@ -94,10 +126,41 @@ pub async fn sync_once(cfg: &AppConfig) -> Result<SyncOutcome> {
     })
 }
 
-async fn fetch_or_restore_today_snapshot(cfg: &AppConfig, b2: &B2Client) -> Result<FetchOutcome> {
+async fn stream_open_day_uploads_until_stopped(
+    cfg: AppConfig,
+    b2: B2Client,
+    day: String,
+    mut stop_rx: watch::Receiver<bool>,
+) {
+    const STREAM_UPLOAD_INTERVAL_SECS: u64 = 6;
+
+    loop {
+        tokio::select! {
+            changed = stop_rx.changed() => {
+                if changed.is_err() || *stop_rx.borrow() {
+                    break;
+                }
+            }
+            _ = time::sleep(Duration::from_secs(STREAM_UPLOAD_INTERVAL_SECS)) => {
+                if *stop_rx.borrow() {
+                    break;
+                }
+                if let Err(err) = upload_local_day(&cfg, &b2, &day, false, false, true).await {
+                    warn!("background open-day upload failed for {}: {}", day, err);
+                }
+            }
+        }
+    }
+}
+
+async fn fetch_or_restore_today_snapshot(
+    cfg: &AppConfig,
+    config_path: &Path,
+    b2: &B2Client,
+) -> Result<FetchOutcome> {
     let day = Utc::now().format("%Y%m%d").to_string();
     if !is_day_upload_eligible(cfg, &day) {
-        return fetch_records_to_local(cfg).await;
+        return fetch_records_to_local(cfg, config_path).await;
     }
 
     let local_snapshot = snapshot_path_for_day(&day);
@@ -106,7 +169,7 @@ async fn fetch_or_restore_today_snapshot(cfg: &AppConfig, b2: &B2Client) -> Resu
 
     // If this day is already in progress locally, keep polling NVR for fresh metadata.
     if local_snapshot.exists() || local_raw.exists() || local_clips.exists() {
-        return fetch_records_to_local(cfg).await;
+        return fetch_records_to_local(cfg, config_path).await;
     }
 
     let prefix_root = cfg.b2.file_prefix.trim_end_matches('/');
@@ -126,10 +189,12 @@ async fn fetch_or_restore_today_snapshot(cfg: &AppConfig, b2: &B2Client) -> Resu
                         "failed to parse restored cloud snapshot {}: {}. Falling back to fresh NVR fetch",
                         snapshot_remote_name, err
                     );
-                    return fetch_records_to_local(cfg).await;
+                    return fetch_records_to_local(cfg, config_path).await;
                 }
             };
-            let local_file = write_verified_snapshot(&data)?;
+            let snapshot = apply_camera_filter_to_snapshot(snapshot, config_path)?;
+            let payload = serde_json::to_vec_pretty(&snapshot)?;
+            let local_file = write_verified_snapshot(&payload)?;
             let raw_records_dir = raw_dir_for_day(&day);
             return Ok(FetchOutcome {
                 snapshot,
@@ -146,11 +211,55 @@ async fn fetch_or_restore_today_snapshot(cfg: &AppConfig, b2: &B2Client) -> Resu
         }
     }
 
-    fetch_records_to_local(cfg).await
+    fetch_records_to_local(cfg, config_path).await
 }
 
 fn day_for_snapshot(snapshot: &SyncSnapshot) -> String {
     snapshot.generated_at.format("%Y%m%d").to_string()
+}
+
+fn load_camera_filter(config_path: &Path) -> Result<CameraFilter> {
+    let filter_path = camera_filter_path_for_config(config_path);
+    CameraFilter::load(&filter_path)
+}
+
+fn apply_camera_filter_to_devices(
+    devices: Vec<NvrDevice>,
+    config_path: &Path,
+) -> Result<Vec<NvrDevice>> {
+    let before = devices.len();
+    let filter = load_camera_filter(config_path)?;
+    let filtered = filter.filter_devices(devices);
+    if filtered.len() != before {
+        info!(
+            "Camera filter applied: {} -> {} device(s)",
+            before,
+            filtered.len()
+        );
+    }
+    Ok(filtered)
+}
+
+fn apply_camera_filter_to_snapshot(
+    snapshot: SyncSnapshot,
+    config_path: &Path,
+) -> Result<SyncSnapshot> {
+    let generated_at = snapshot.generated_at;
+    let devices = apply_camera_filter_to_devices(snapshot.devices, config_path)?;
+    let allowed_ips: HashSet<String> = devices.iter().map(|d| d.ip.to_string()).collect();
+    let records: Vec<DeviceRecord> = snapshot
+        .records
+        .into_iter()
+        .filter(|record| allowed_ips.contains(&record.ip))
+        .collect();
+
+    Ok(SyncSnapshot {
+        generated_at,
+        device_count: devices.len(),
+        record_count: records.len(),
+        devices,
+        records,
+    })
 }
 
 async fn ensure_snapshot_uploaded_for_day(
@@ -160,9 +269,10 @@ async fn ensure_snapshot_uploaded_for_day(
     local_snapshot_path: &Path,
 ) -> Result<()> {
     if !is_day_upload_eligible(cfg, day) {
-        eprintln!(
+        crate::progress!(
             "[progress] cloud snapshot deferred by lag policy (day={}, lag_days={})",
-            day, cfg.b2.upload_lag_days
+            day,
+            cfg.b2.upload_lag_days
         );
         return Ok(());
     }
@@ -170,7 +280,7 @@ async fn ensure_snapshot_uploaded_for_day(
     let prefix_root = cfg.b2.file_prefix.trim_end_matches('/');
     let snapshot_remote_name = format!("{prefix_root}/records/{day}/snapshot-{day}.json");
     if b2_file_exists_retry(b2, &snapshot_remote_name).await? {
-        eprintln!(
+        crate::progress!(
             "[progress] cloud snapshot already present: {}",
             snapshot_remote_name
         );
@@ -184,13 +294,13 @@ async fn ensure_snapshot_uploaded_for_day(
     }
 
     let data = std::fs::read(local_snapshot_path)?;
-    eprintln!(
+    crate::progress!(
         "[progress] cloud upload snapshot: {} ({})",
         snapshot_remote_name,
         format_size(data.len() as u64)
     );
     b2_upload_retry(b2, &snapshot_remote_name, "application/json", &data).await?;
-    eprintln!(
+    crate::progress!(
         "[progress] cloud uploaded snapshot: {}",
         snapshot_remote_name
     );
@@ -201,8 +311,10 @@ async fn ensure_snapshot_uploaded_for_day(
     Ok(())
 }
 
-pub async fn fetch_records_to_local(cfg: &AppConfig) -> Result<FetchOutcome> {
-    let devices = discover_devices(&cfg.scan, &cfg.nvr).await?;
+pub async fn fetch_records_to_local(cfg: &AppConfig, config_path: &Path) -> Result<FetchOutcome> {
+    let mut devices = discover_devices(&cfg.scan, &cfg.nvr).await?;
+    devices = apply_camera_filter_to_devices(devices, config_path)?;
+
     let client = reqwest::Client::new();
     let records = collect_records(&client, &devices, &cfg.nvr).await;
 
@@ -225,7 +337,7 @@ pub async fn fetch_records_to_local(cfg: &AppConfig) -> Result<FetchOutcome> {
     })
 }
 
-pub async fn run_loop(cfg: &AppConfig) -> Result<()> {
+pub async fn run_loop(cfg: &AppConfig, config_path: &Path) -> Result<()> {
     let mut ticker = time::interval(Duration::from_secs(cfg.scheduler.interval_seconds.max(5)));
     ticker.set_missed_tick_behavior(time::MissedTickBehavior::Skip);
 
@@ -258,7 +370,7 @@ pub async fn run_loop(cfg: &AppConfig) -> Result<()> {
                     }
                     Ok(false) => {
                         info!("Starting sync cycle for day {today}");
-                        match sync_once(cfg).await {
+                        match sync_once(cfg, config_path).await {
                             Ok(outcome) => {
                                 info!(
                                     "Sync cycle complete: {} devices, {} records, saved snapshot {}, raw {}, uploaded day(s)={}, local day(s) deleted={}, cloud file(s) deleted={}",
@@ -293,7 +405,7 @@ pub async fn run_loop(cfg: &AppConfig) -> Result<()> {
     Ok(())
 }
 
-pub async fn run_local_loop(cfg: &AppConfig) -> Result<()> {
+pub async fn run_local_loop(cfg: &AppConfig, config_path: &Path) -> Result<()> {
     let mut ticker = time::interval(Duration::from_secs(cfg.scheduler.interval_seconds.max(5)));
     ticker.set_missed_tick_behavior(time::MissedTickBehavior::Skip);
 
@@ -306,7 +418,7 @@ pub async fn run_local_loop(cfg: &AppConfig) -> Result<()> {
         tokio::select! {
             _ = ticker.tick() => {
                 info!("Starting local snapshot+clip cycle");
-                match fetch_records_to_local(cfg).await {
+                match fetch_records_to_local(cfg, config_path).await {
                     Ok(snapshot_outcome) => {
                         info!(
                             "Local snapshot complete: {} devices, {} records, saved snapshot {}, raw {}",
@@ -319,6 +431,7 @@ pub async fn run_local_loop(cfg: &AppConfig) -> Result<()> {
                             clips_dir_for_snapshot(snapshot_outcome.snapshot.generated_at);
                         match fetch_video_clips_for_devices(
                             cfg,
+                            config_path,
                             &snapshot_outcome.snapshot.devices,
                             1,
                             0,
@@ -359,11 +472,12 @@ pub async fn run_local_loop(cfg: &AppConfig) -> Result<()> {
 
 pub async fn fetch_video_clips_local(
     cfg: &AppConfig,
+    config_path: &Path,
     days: u32,
     max_clips: usize,
     clip_seconds: u32,
 ) -> Result<ClipFetchOutcome> {
-    eprintln!(
+    crate::progress!(
         "[progress] starting video download: days={}, max_clips={}, clip_seconds={}",
         days,
         if max_clips == 0 {
@@ -391,16 +505,28 @@ pub async fn fetch_video_clips_local(
             clip_seconds.to_string()
         }
     );
-    eprintln!("[progress] discovering devices");
+    crate::progress!("[progress] discovering devices");
     info!("Discovering devices for video download");
-    let devices = discover_devices(&cfg.scan, &cfg.nvr).await?;
-    eprintln!("[progress] discovered {} device(s)", devices.len());
+    let mut devices = discover_devices(&cfg.scan, &cfg.nvr).await?;
+    devices = apply_camera_filter_to_devices(devices, config_path)?;
+
+    crate::progress!("[progress] discovered {} device(s)", devices.len());
     info!("Discovered {} device(s) for video download", devices.len());
-    fetch_video_clips_for_devices(cfg, &devices, days, max_clips, clip_seconds, None).await
+    fetch_video_clips_for_devices(
+        cfg,
+        config_path,
+        &devices,
+        days,
+        max_clips,
+        clip_seconds,
+        None,
+    )
+    .await
 }
 
 async fn fetch_video_clips_for_devices(
     cfg: &AppConfig,
+    config_path: &Path,
     devices: &[NvrDevice],
     days: u32,
     max_clips: usize,
@@ -408,12 +534,13 @@ async fn fetch_video_clips_for_devices(
     output_dir: Option<&Path>,
 ) -> Result<ClipFetchOutcome> {
     let client = reqwest::Client::new();
+    let filter = load_camera_filter(config_path)?;
     let mut clips = Vec::new();
 
     if max_clips == 0 && output_dir.is_none() {
         let parallelism = devices.len().clamp(1, 4);
         let output_dir = output_dir.map(Path::to_path_buf);
-        eprintln!(
+        crate::progress!(
             "[progress] starting parallel download across {} device(s), concurrency={}",
             devices.len(),
             parallelism
@@ -428,10 +555,12 @@ async fn fetch_video_clips_for_devices(
             let client = client.clone();
             let nvr = cfg.nvr.clone();
             let output_dir = output_dir.clone();
+            let track_rules = filter.track_rules_for_device(&device);
             async move {
-                eprintln!(
+                crate::progress!(
                     "[progress] processing device {} provider={}",
-                    device.ip, device.provider
+                    device.ip,
+                    device.provider
                 );
                 info!(
                     "Processing device {} provider={} ports={:?}",
@@ -444,6 +573,8 @@ async fn fetch_video_clips_for_devices(
                     days,
                     0,
                     clip_seconds,
+                    cfg.download.max_chunk_size_mb,
+                    track_rules.as_ref(),
                     output_dir.as_deref(),
                 )
                 .await;
@@ -454,7 +585,7 @@ async fn fetch_video_clips_for_devices(
 
         while let Some((device, result)) = jobs.next().await {
             let downloaded = result?;
-            eprintln!(
+            crate::progress!(
                 "[progress] device {} done, downloaded {} file(s)",
                 device.ip,
                 downloaded.len()
@@ -467,7 +598,7 @@ async fn fetch_video_clips_for_devices(
             clips.extend(downloaded);
         }
 
-        eprintln!(
+        crate::progress!(
             "[progress] completed: {} device(s), {} saved file(s)",
             devices.len(),
             clips.len()
@@ -484,9 +615,10 @@ async fn fetch_video_clips_for_devices(
     }
 
     for device in devices {
-        eprintln!(
+        crate::progress!(
             "[progress] processing device {} provider={}",
-            device.ip, device.provider
+            device.ip,
+            device.provider
         );
         info!(
             "Processing device {} provider={} ports={:?}",
@@ -498,6 +630,7 @@ async fn fetch_video_clips_for_devices(
         } else {
             max_clips.saturating_sub(clips.len())
         };
+        let track_rules = filter.track_rules_for_device(device);
         let mut downloaded = providers::download_video_clips_for_device(
             &client,
             device,
@@ -505,27 +638,30 @@ async fn fetch_video_clips_for_devices(
             days,
             per_device_limit,
             clip_seconds,
+            cfg.download.max_chunk_size_mb,
+            track_rules.as_ref(),
             output_dir,
         )
         .await?;
         clips.append(&mut downloaded);
         let added = clips.len().saturating_sub(before);
-        eprintln!(
+        crate::progress!(
             "[progress] device {} done, downloaded {} file(s)",
-            device.ip, added
+            device.ip,
+            added
         );
         info!(
             "Device {} finished: downloaded {} file(s)",
             device.ip, added
         );
         if max_clips > 0 && clips.len() >= max_clips {
-            eprintln!("[progress] reached max_clips limit ({max_clips})");
+            crate::progress!("[progress] reached max_clips limit ({max_clips})");
             info!("Reached global max_clips limit ({max_clips})");
             break;
         }
     }
 
-    eprintln!(
+    crate::progress!(
         "[progress] completed: {} device(s), {} saved file(s)",
         devices.len(),
         clips.len()
@@ -663,7 +799,7 @@ async fn upload_local_day(
     let mut uploaded_bytes = 0u64;
     let mut pending_incomplete_clips = 0usize;
 
-    eprintln!(
+    crate::progress!(
         "[progress] cloud sync day {}: mode={}, snapshot={}, raw={}, clips={}",
         day,
         if finalize_day { "finalize" } else { "open" },
@@ -687,7 +823,7 @@ async fn upload_local_day(
     if snapshot_present {
         if overwrite_snapshot || !remote_names.contains(&snapshot_remote_name) {
             let data = std::fs::read(&snapshot_path)?;
-            eprintln!(
+            crate::progress!(
                 "[progress] cloud upload snapshot: {} ({})",
                 snapshot_remote_name,
                 format_size(data.len() as u64)
@@ -696,7 +832,7 @@ async fn upload_local_day(
             remote_names.insert(snapshot_remote_name.clone());
             uploaded_files += 1;
             uploaded_bytes += data.len() as u64;
-            eprintln!(
+            crate::progress!(
                 "[progress] cloud uploaded snapshot: {}",
                 snapshot_remote_name
             );
@@ -720,7 +856,7 @@ async fn upload_local_day(
         };
         let file_name = format!("{prefix_root}/records/{day}/raw/{name}");
         if !remote_names.contains(&file_name) {
-            eprintln!(
+            crate::progress!(
                 "[progress] cloud upload raw: {} ({})",
                 file_name,
                 format_size(data.len() as u64)
@@ -729,7 +865,7 @@ async fn upload_local_day(
             remote_names.insert(file_name);
             uploaded_files += 1;
             uploaded_bytes += data.len() as u64;
-            eprintln!("[progress] cloud uploaded raw: {}", name);
+            crate::progress!("[progress] cloud uploaded raw: {}", name);
         }
         if remove_local_after_upload && raw_path.exists() {
             std::fs::remove_file(&raw_path)?;
@@ -744,7 +880,7 @@ async fn upload_local_day(
         let resume_sidecar = clip_resume_sidecar_path(&clip_path);
         if resume_sidecar.exists() || !complete_marker.exists() {
             pending_incomplete_clips += 1;
-            eprintln!(
+            crate::progress!(
                 "[progress] cloud skip clip (incomplete): {} (resume_part={}, complete_marker={})",
                 name,
                 if resume_sidecar.exists() { "yes" } else { "no" },
@@ -764,7 +900,7 @@ async fn upload_local_day(
         };
         let file_name = format!("{prefix_root}/records/{day}/clips/{name}");
         if !remote_names.contains(&file_name) {
-            eprintln!(
+            crate::progress!(
                 "[progress] cloud upload clip: {} ({})",
                 file_name,
                 format_size(data.len() as u64)
@@ -773,7 +909,7 @@ async fn upload_local_day(
             remote_names.insert(file_name);
             uploaded_files += 1;
             uploaded_bytes += data.len() as u64;
-            eprintln!("[progress] cloud uploaded clip: {}", name);
+            crate::progress!("[progress] cloud uploaded clip: {}", name);
         }
         if remove_local_after_upload && clip_path.exists() {
             std::fs::remove_file(&clip_path)?;
@@ -791,12 +927,13 @@ async fn upload_local_day(
 
     if !finalize_day {
         if pending_incomplete_clips > 0 {
-            eprintln!(
+            crate::progress!(
                 "[progress] cloud day {} has {} incomplete clip(s); will retry next cycle",
-                day, pending_incomplete_clips
+                day,
+                pending_incomplete_clips
             );
         }
-        eprintln!(
+        crate::progress!(
             "[progress] cloud day {} synced: {} file(s), {} uploaded",
             day,
             uploaded_files,
@@ -821,7 +958,7 @@ async fn upload_local_day(
         "clip_file_count": clip_file_count
     }))?;
     if !remote_names.contains(&marker_name) {
-        eprintln!(
+        crate::progress!(
             "[progress] cloud upload marker: {} ({})",
             marker_name,
             format_size(marker.len() as u64)
@@ -829,9 +966,9 @@ async fn upload_local_day(
         b2_upload_retry(b2, &marker_name, "application/json", &marker).await?;
         uploaded_files += 1;
         uploaded_bytes += marker.len() as u64;
-        eprintln!("[progress] cloud uploaded marker: {}", marker_name);
+        crate::progress!("[progress] cloud uploaded marker: {}", marker_name);
     }
-    eprintln!(
+    crate::progress!(
         "[progress] cloud day {} finalized: {} file(s), {} uploaded",
         day,
         uploaded_files,

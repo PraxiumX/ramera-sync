@@ -1,0 +1,12 @@
+dist/ramera-sync-20260309T122203Z/DEPLOY.md
+dist/ramera-sync-20260309T122203Z/LICENSE
+dist/ramera-sync-20260309T122203Z/MANIFEST.txt
+dist/ramera-sync-20260309T122203Z/README.md
+dist/ramera-sync-20260309T122203Z/camera-filter.conf
+dist/ramera-sync-20260309T122203Z/ffmpeg/ffmpeg
+dist/ramera-sync-20260309T122203Z/ffmpeg/ffprobe
+dist/ramera-sync-20260309T122203Z/ramera-sync
+dist/ramera-sync-20260309T122203Z/run.sh
+dist/ramera-sync-20260309T122203Z/scripts/install_ffmpeg.sh
+dist/ramera-sync-20260309T122203Z/settings.conf
+dist/ramera-sync-20260309T122203Z/settings.conf.example

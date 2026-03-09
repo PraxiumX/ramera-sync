@@ -10,7 +10,9 @@ pub struct AppConfig {
     pub scan: ScanConfig,
     pub nvr: NvrConfig,
     pub scheduler: SchedulerConfig,
+    pub download: DownloadConfig,
     pub b2: B2Config,
+    pub zero_log: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -33,6 +35,12 @@ pub struct NvrConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SchedulerConfig {
     pub interval_seconds: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DownloadConfig {
+    pub max_chunk_size_mb: u32,
+    pub sync_clip_seconds: u32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -70,6 +78,10 @@ impl Default for AppConfig {
             scheduler: SchedulerConfig {
                 interval_seconds: 300,
             },
+            download: DownloadConfig {
+                max_chunk_size_mb: 500,
+                sync_clip_seconds: 0,
+            },
             b2: B2Config {
                 key_id: "${B2_KEY_ID}".to_string(),
                 application_key: "${B2_APPLICATION_KEY}".to_string(),
@@ -79,6 +91,7 @@ impl Default for AppConfig {
                 max_upload_days: 7,
                 upload_lag_days: 1,
             },
+            zero_log: false,
         }
     }
 }
@@ -124,6 +137,16 @@ impl AppConfig {
         if self.scheduler.interval_seconds < 5 {
             return Err(AppError::ConfigParse(
                 "scheduler.interval_seconds must be >= 5".to_string(),
+            ));
+        }
+        if self.download.max_chunk_size_mb == 0 {
+            return Err(AppError::ConfigParse(
+                "download.max_chunk_size_mb must be > 0".to_string(),
+            ));
+        }
+        if self.download.max_chunk_size_mb < 10 {
+            return Err(AppError::ConfigParse(
+                "download.max_chunk_size_mb should be >= 10 (minimum 10 MB)".to_string(),
             ));
         }
         if self.b2.max_upload_days == 0 {
@@ -207,6 +230,12 @@ impl AppConfig {
                 "scheduler.interval_seconds" => {
                     cfg.scheduler.interval_seconds = parse_u64(value, line_num, key)?
                 }
+                "download.max_chunk_size_mb" => {
+                    cfg.download.max_chunk_size_mb = parse_u32(value, line_num, key)?
+                }
+                "download.sync_clip_seconds" => {
+                    cfg.download.sync_clip_seconds = parse_u32(value, line_num, key)?
+                }
                 "b2.key_id" => cfg.b2.key_id = parse_string(value),
                 "b2.application_key" => cfg.b2.application_key = parse_string(value),
                 "b2.bucket_id" => cfg.b2.bucket_id = parse_string(value),
@@ -218,6 +247,7 @@ impl AppConfig {
                 "b2.upload_lag_days" => {
                     cfg.b2.upload_lag_days = parse_u32(value, line_num, key)?;
                 }
+                "zero_log" => cfg.zero_log = parse_bool(value, line_num, key)?,
                 _ => {
                     return Err(AppError::ConfigParse(format!(
                         "line {line_num}: unknown key `{key}`"
@@ -262,6 +292,12 @@ nvr.include_https={}
 
 scheduler.interval_seconds={}
 
+# Download chunk size limit (in MB) to prevent crashing on low-resource PCs
+# Recommended: 100-500 MB
+download.max_chunk_size_mb={}
+# Cloud sync clip length in seconds (0 = full record)
+download.sync_clip_seconds={}
+
 b2.key_id={}
 b2.application_key={}
 b2.bucket_id={}
@@ -269,6 +305,9 @@ b2.file_prefix={}
 b2.api_base=https://api.backblazeb2.com
 b2.max_retentation_days={}
 b2.upload_lag_days={}
+
+# Suppress progress/tracing logs (true/false)
+zero_log={}
 ",
             cfg.scan.cidr,
             join_u16(&cfg.scan.ports),
@@ -278,12 +317,15 @@ b2.upload_lag_days={}
             cfg.nvr.request_timeout_ms,
             cfg.nvr.include_https,
             cfg.scheduler.interval_seconds,
+            cfg.download.max_chunk_size_mb,
+            cfg.download.sync_clip_seconds,
             cfg.b2.key_id,
             cfg.b2.application_key,
             cfg.b2.bucket_id,
             cfg.b2.file_prefix,
             cfg.b2.max_upload_days,
-            cfg.b2.upload_lag_days
+            cfg.b2.upload_lag_days,
+            cfg.zero_log
         )
     }
 }

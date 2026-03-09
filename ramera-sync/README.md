@@ -1,116 +1,203 @@
 # ramera-sync
 
-`ramera-sync` is a Rust CLI for NVR discovery, record metadata collection, local clip download, and optional Backblaze B2 upload.
+`ramera-sync` is a Rust CLI for:
+- discovering NVR devices on LAN
+- collecting record metadata
+- downloading video clips locally
+- optionally uploading day-based data to Backblaze B2
 
-## What it does
+Currently implemented provider: `hikvision` (`generic` fallback for discovery/records).
 
-- Scans your LAN CIDR to find NVR devices.
-- Detects provider module (`hikvision` implemented, `generic` fallback).
-- Pulls record metadata over HTTP/ISAPI.
-- Downloads actual video clips over RTSP with `ffmpeg`.
-- Stores files locally first under `records/`.
-- In cloud mode, uploads daily records + clips to Backblaze B2 with retention cleanup.
+## Fast Setup
 
-## Project layout
+### Local-only (no B2)
 
-- Config: `settings.conf` — runtime configuration (may contain sensitive credentials; do not commit to public repositories)
-- Local ffmpeg binary: `ffmpeg/ffmpeg`
-- Daily snapshot: `records/snapshot-YYYYMMDD.json`
-- Daily raw metadata files: `records/raw/YYYYMMDD/`
-- Downloaded video clips: `records/clips/<timestamp>/` (manual `video-clips`)
-- `run-local` cycle clips: `records/clips/snapshot-<YYYYMMDD>/`
+```bash
+# 1) Create config files
+cargo run --release -- init-config --path settings.conf
 
-## Setup
+# 2) Edit settings.conf (set scan.cidr + nvr.username + nvr.password)
 
-1. Create config:
+# 3) Discover NVR + tracks and populate camera-filter.conf
+cargo run --release -- discover --config settings.conf
+
+# 4) Edit camera-filter.conf (enable/disable device + track lines)
+
+# 5) Quick validation run (local only)
+cargo run --release -- test-mode --config settings.conf --no-b2
+
+# 6) Start local periodic loop
+cargo run --release -- run-local --config settings.conf
+```
+
+### With B2 upload
+
+```bash
+# 1) Create config files
+cargo run --release -- init-config --path settings.conf
+
+# 2) Edit settings.conf (scan/nvr fields + b2.key_id + b2.application_key + b2.bucket_id + b2.file_prefix)
+# Optional: cloud clip length (0 = full record)
+# download.sync_clip_seconds=30
+
+# Optional: upload same day data immediately
+# b2.upload_lag_days=0
+
+# 3) Discover NVR + tracks and populate camera-filter.conf
+cargo run --release -- discover --config settings.conf
+
+# 4) Edit camera-filter.conf (enable/disable device + track lines)
+
+# 5) Validate runtime + B2 connectivity
+cargo run --release -- healthcheck --config settings.conf --check-b2
+
+# 6) One-shot sync (local save + cloud upload)
+cargo run --release -- sync-once --config settings.conf
+
+# 7) Or start periodic cloud loop
+cargo run --release -- run --config settings.conf
+```
+
+## Quick Start
+
+1. Generate config files:
 
 ```bash
 cargo run -- init-config --path settings.conf
 ```
 
-2. Edit `settings.conf` (minimum fields):
+This creates both:
+- `settings.conf`
+- `camera-filter.conf`
+
+2. Edit `settings.conf` (minimum):
 
 ```conf
 scan.cidr=192.168.1.0/24
 nvr.username=admin
 nvr.password=YOUR_PASSWORD
+download.max_chunk_size_mb=100
+download.sync_clip_seconds=0
 ```
 
-3. Install local ffmpeg into this project folder:
+3. Discover devices and populate filter:
 
 ```bash
-cargo run -- install-ffmpeg --dir ffmpeg
+cargo run -- discover --config settings.conf
 ```
 
-## Command reference
+4. Edit `camera-filter.conf`:
+
+```conf
+# Device format: ip | enabled(true/false) | friendly_name
+# Track format:  ip | track101 | enabled(true/false) | friendly_name | status
+192.168.1.245 | true  | Main NVR
+192.168.1.245 | track101 | true  | Front Door | active
+192.168.1.245 | track102 | false | Back Yard  | no_records
+```
+
+5. Run smoke test:
 
 ```bash
-# Show all commands
+cargo run -- test-mode --config settings.conf --no-b2
+```
+
+6. Run production commands:
+
+```bash
+cargo run --release -- healthcheck --config settings.conf --check-b2
+cargo run --release -- sync-once --config settings.conf
+# one-off override:
+# cargo run --release -- sync-once --config settings.conf --sync-clip-seconds 30
+# or periodic mode:
+cargo run --release -- run --config settings.conf
+```
+
+## Command Cheat Sheet
+
+```bash
+# All commands
 cargo run -- --help
 
-# Show video-clips options
-cargo run -- video-clips --help
-
-# Run end-to-end smoke test (healthcheck + discover + records + 30s clip + B2 upload verify)
-cargo run -- test-mode --config settings.conf
-
-# Validate runtime dependencies/config (and optional B2 connectivity)
-cargo run -- healthcheck --config settings.conf
-cargo run -- healthcheck --config settings.conf --check-b2
-```
-
-```bash
-# Discover devices
+# Discover and update camera-filter.conf
 cargo run -- discover --config settings.conf
 
-# Fetch metadata only (JSON snapshot + raw XML/JSON payloads)
+# Fetch metadata only (snapshot + raw payload files)
 cargo run -- video-records --config settings.conf
 
-# Fetch metadata and print snapshot JSON
-cargo run -- video-records --config settings.conf --json
-
-# Download video clips (last 1 day, max 3 clips, each up to 10s)
+# Download clips
 cargo run -- video-clips --config settings.conf --days 1 --max-clips 3 --clip-seconds 10
 
-# End-to-end smoke test with explicit options (example)
-cargo run -- test-mode --config settings.conf --days 1 --max-clips 1 --clip-seconds 30
-
-# Skip B2 verification when testing local-only
-cargo run -- test-mode --config settings.conf --no-b2
-
-# Download ALL clips found in range (0 means no clip limit)
-cargo run -- video-clips --config settings.conf --days 30 --max-clips 0 --clip-seconds 30
-
-# Download ALL full records directly (no clip limit, no duration trim)
+# Full-length records (no trim)
 cargo run -- video-clips --config settings.conf --days 30 --max-clips 0 --clip-seconds 0
 
-# Local-only loop (no B2 upload). Each cycle saves clips under:
-# records/clips/snapshot-<YYYYMMDD>/
+# Local periodic mode (no B2)
 cargo run -- run-local --config settings.conf
 
-# Full sync once (local save + B2 upload)
+# Cloud one-shot sync
 cargo run -- sync-once --config settings.conf
-
-# Full periodic loop (local + B2 day-based upload/cleanup)
-cargo run -- run --config settings.conf
 ```
 
-## Testing flow (recommended)
+## Camera Filtering
 
-1. `cargo run -- test-mode --config settings.conf`
-2. If needed, run each step manually for troubleshooting:
-   - `cargo run -- discover --config settings.conf`
-   - `cargo run -- video-records --config settings.conf`
-   - `cargo run -- video-clips --config settings.conf --days 1 --max-clips 1 --clip-seconds 30`
-   - `cargo run -- sync-once --config settings.conf` (B2 upload path)
-3. Check outputs:
-   - `records/snapshot-YYYYMMDD.json`
-   - `records/raw/YYYYMMDD/`
-   - `records/clips/<timestamp>/` or `records/clips/snapshot-<YYYYMMDD>/`
+`camera-filter.conf` controls which devices and tracks are processed.
 
-## Backblaze B2 (optional)
+Example:
 
-Set these in `settings.conf` when you want uploads:
+```conf
+# device line:
+192.168.1.245 | true | Main NVR
+
+# track lines:
+192.168.1.245 | track101 | true  | Front Door | active
+192.168.1.245 | track102 | false | Back Yard  | no_records
+```
+
+Behavior:
+- created by `init-config`
+- updated by `discover` (includes discovered Hikvision tracks + recent usage status)
+- applied before metadata pull
+- applied before clip download
+- applied when restoring cloud snapshot for sync logic
+
+Rules:
+- if device line is `false`, all tracks are skipped
+- if a track line is `false`, that track is skipped
+- tracks without explicit lines default to `true`
+- `status` is informational (it does not control filtering)
+- `status=active` means at least one recent record was found in probe window (last 1 day)
+- `status=no_records` means no records were found in probe window
+- `status=unknown` means activity probe was not available
+
+Important path rule:
+- `camera-filter.conf` is resolved next to the `--config` file path.
+- If you run with `--config /path/to/settings.conf`, filter is `/path/to/camera-filter.conf`.
+
+## Download Chunk Size (Low-Resource Safety)
+
+Use:
+
+```conf
+download.max_chunk_size_mb=100
+# Cloud sync clip length (0 = full record)
+download.sync_clip_seconds=0
+```
+
+Behavior:
+- ffmpeg is started with size cap (`-fs`)
+- resumed clips use **remaining** size budget, not full budget again
+- if existing clip already reached max chunk size, it is skipped
+
+This keeps final clip files bounded and avoids runaway growth on resume.
+
+Suggested values:
+- 2 GB RAM devices: `100-200`
+- 4 GB RAM devices: `200-500`
+- 8+ GB RAM devices: `500+`
+
+## B2 Configuration (Optional)
+
+Set in `settings.conf`:
 
 ```conf
 b2.key_id=${B2_KEY_ID}
@@ -119,45 +206,56 @@ b2.bucket_id=${B2_BUCKET_ID}
 b2.file_prefix=ramera/nvr-snapshots
 b2.max_retentation_days=60
 b2.upload_lag_days=1
+zero_log=false
 ```
 
-`video-records` and `run-local` do not require B2 credentials.
+Notes:
+- `video-records` and `run-local` do not require B2 credentials.
+- `run` and `sync-once` use day-based upload/finalization with `_complete.json` markers.
+- Cloud clip length is controlled by `download.sync_clip_seconds` (`0` = full record).
+- CLI override is available: `run --sync-clip-seconds <N>` / `sync-once --sync-clip-seconds <N>`.
+- In cloud mode, completed clips can be uploaded while later clips are still downloading (pipelined).
+- cloud cleanup respects `b2.max_retentation_days`.
 
-## Notes
+## Output Layout
 
-- Config format is plain text `key=value` (not TOML).
-- NVR HTTP auth supports Basic and Digest.
-- `video-clips` ffmpeg lookup order:
+- `settings.conf`
+- `camera-filter.conf`
+- `records/snapshot-YYYYMMDD.json`
+- `records/raw/YYYYMMDD/*.xml|json`
+- `records/clips/<timestamp>/*.mkv` (`video-clips`)
+- `records/clips/snapshot-<YYYYMMDD>/*.mkv` (`run-local` and `sync-once`)
+
+## Runtime Notes
+
+- Config format is `key=value` (not TOML).
+- HTTP auth supports Basic and Digest.
+- ffmpeg lookup order:
   - `FFMPEG_BIN` env var
   - `ffmpeg/ffmpeg`
   - system `ffmpeg`
-- `run` and `run-local` prefer existing runtime `ffmpeg`/`ffprobe` (env var or system). If unavailable, they auto-install local binaries into `ffmpeg/` using `scripts/install_ffmpeg.sh`.
-- B2 uploads use SHA1 verification (`sha1sum`, `shasum`, or `openssl`) plus response metadata checks.
-- `video-clips` with `--clip-seconds 0` downloads full-length records.
-- `run-local` now always downloads all clips for the same snapshot cycle into a single folder:
-  - `records/clips/snapshot-<YYYYMMDD>/`
-- `run` / `sync-once` cloud behavior:
-  - `run` processes one cloud upload cycle per UTC day (not every scheduler tick)
-  - upload lag is controlled by `b2.upload_lag_days` (default `1`): only days older than this lag are uploaded/finalized
-  - deferred (too recent) days stay local-only until they become eligible for cloud upload
-  - if a deferred day has `_complete.json` accidentally, marker is removed so the day can continue updating locally
-  - when a day becomes eligible, it uploads `snapshot/raw/clips` and writes `_complete.json`
-  - uploads day-by-day under `b2.file_prefix/records/YYYYMMDD/`
-  - uploads `snapshot`, `raw` payload files, and clip `.mkv` files for the day
-  - only processes days inside `b2.max_retentation_days`
-  - deletes each local file immediately after its upload is confirmed
-  - day folder cleanup happens after upload confirmation marker is uploaded
-  - deletes cloud/local files older than `b2.max_retentation_days`
-  - requires non-empty `b2.file_prefix` when B2 credentials are configured
-- If a clip file already exists with the same name, downloader attempts resume from existing MKV duration instead of restarting from zero.
-- Unlimited clip mode in manual `video-clips` command can download across devices in parallel (bounded concurrency).
-- Background cycles (`run` / `run-local`) use sequential device clip pulls for lower hardware load.
-- Writer commands are single-instance on host (default lock file `/tmp/ramera-sync-cli.lock`) to prevent concurrent state corruption across different working directories. Override with `RAMERA_SYNC_LOCK_PATH` if needed.
-- B2 operations use retry with exponential backoff for transient errors.
-- CLI prints live progress logs during download (device discovery, track search, and each saved file).
-- Cloud sync prints live `[progress]` upload lines (snapshot/raw/clips/marker with uploaded size).
-- Cloud clip uploads are guarded: only clips with a local `.complete` sidecar are uploaded; `.resume.part`/incomplete clips are skipped.
-- Deferred day does not re-upload a clip with the same filename once it already exists in cloud.
-- If needed, force log level explicitly with `RUST_LOG=info`.
-- In cloud mode, local day files are cleaned up after confirmed upload marker.
-- TLS cert validation is disabled for local probing.
+- ffprobe lookup order:
+  - `FFPROBE_BIN` env var
+  - `ffmpeg/ffprobe`
+  - system `ffprobe`
+- `run` and `run-local` auto-install local `ffmpeg/ffprobe` if missing and runtime tools are unavailable.
+- B2 operations use retry with exponential backoff.
+- Incomplete clips (`.resume.part` or missing `.complete`) are skipped for cloud upload.
+- `sync-once`/`run` perform open-day upload passes during clip download, then finalize the day at the end.
+- Set `zero_log=true` in `settings.conf` to suppress tracing + `[progress]` logs.
+
+## Troubleshooting
+
+- No clips downloaded in `test-mode`:
+  - retry; NVR RTSP sessions can be temporarily saturated
+  - test with smaller `--max-clips` and shorter `--clip-seconds`
+- Need per-camera filtering:
+  - run `discover` first to populate `trackXXX` lines
+  - set unwanted tracks to `false` in `camera-filter.conf`
+  - run `video-clips` or `sync-once` again
+- Filter not applied as expected:
+  - verify you edited the `camera-filter.conf` next to the exact `--config` path you use
+  - run `discover` again to refresh entries
+- Missing dependencies:
+  - run `cargo run -- healthcheck --config settings.conf`
+  - install local binaries with `cargo run -- install-ffmpeg --dir ffmpeg`
